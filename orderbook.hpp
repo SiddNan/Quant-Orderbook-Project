@@ -1,368 +1,133 @@
-#include "order_book.hpp"
-#include <algorithm>
-#include <chrono>
+#pragma once
+#include <cstdint>
+#include <vector>
+#include <map>
+#include <deque>
+#include <unordered_map>
+#include <functional>
+#include <atomic>
 #include <mutex>
 
-using namespace HFTUtils;
 
-OrderBook::OrderBook(size_t maxOrders) {
-    orders_.reserve(maxOrders);
-}
+static constexpr int64_t TICK_PRECISION = 100;
 
-uint64_t OrderBook::getCurrentTimeNs() const {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::high_resolution_clock::now().time_since_epoch()
-    ).count();
-}
+enum class Side       { Buy, Sell };
+enum class OrderType  { Limit, Market };
+enum class TimeInForce{ GTC, IOC, FOK, GFD };
 
-bool OrderBook::submitOrder(const Order& o, std::vector<Fill>* fills) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    uint64_t startTime = getCurrentTimeNs();
-    
-    // FOK pre-check
-    if (UNLIKELY(o.tif == TimeInForce::FOK && !canFullyFill(o))) {
-        return false;
-    }
+struct Fill {
+    uint64_t makerOrderId;
+    uint64_t takerOrderId;
+    uint32_t quantity;
+    int64_t  priceTick;
+    uint64_t timestamp;
+};
 
-    uint32_t remaining = o.quantity;
-    matchLoop(o, remaining, fills);
+struct Order {
+    uint64_t    id;
+    Side        side;
+    int64_t     priceTick;
+    uint32_t    quantity;
+    OrderType   type;
+    TimeInForce tif;
+    uint32_t    ownerId;
+    uint64_t    timestamp;
+};
 
-    // Handle remaining quantity
-    if (remaining > 0) {
-        if (UNLIKELY(o.tif == TimeInForce::IOC || o.tif == TimeInForce::FOK)) {
-            return true;
-        }
-        restOrder(o, remaining);
-    }
-    
-    // Update performance statistics
-    uint64_t processingTime = getCurrentTimeNs() - startTime;
-    stats_.ordersProcessed.fetch_add(1, std::memory_order_relaxed);
-    stats_.avgProcessingTimeNs.store(processingTime, std::memory_order_relaxed);
-    
-    return true;
-}
+struct LevelInfo {
+    int64_t    priceTick;
+    uint64_t   totalQuantity;
+    uint32_t   count;
+    uint32_t   padding;
+};
 
-void OrderBook::matchLoop(const Order& incomingOrder, uint32_t& remaining, std::vector<Fill>* fills) {
-    auto& contraLevels = (incomingOrder.side == Side::Buy) ? asks_ : bids_;
-    
-    if (incomingOrder.side == Side::Buy) {
-        // Buy order: match against asks
-        auto it = contraLevels.begin();
-        while (remaining > 0 && it != contraLevels.end() && it->first <= incomingOrder.priceTick) {
-            auto& queue = it->second;
-            
-            while (remaining > 0 && !queue.empty()) {
-                Order* restingOrder = queue.front();
-                
-                // Prevent self-matching
-                if (UNLIKELY(restingOrder->ownerId == incomingOrder.ownerId)) {
-                    break;
-                }
-                
-                uint32_t fillQty = std::min(remaining, restingOrder->quantity);
-                
-                Fill fill{
-                    restingOrder->id,
-                    incomingOrder.id,
-                    fillQty,
-                    it->first,
-                    getCurrentTimeNs()
-                };
-                
-                if (fills) fills->push_back(fill);
-                if (fillCb_) fillCb_(fill);
-                
-                restingOrder->quantity -= fillQty;
-                remaining -= fillQty;
-                
-                if (restingOrder->quantity == 0) {
-                    orders_.erase(restingOrder->id);
-                    queue.pop_front();
-                }
-                
-                stats_.fillsGenerated.fetch_add(1, std::memory_order_relaxed);
-            }
-            
-            if (queue.empty()) {
-                it = contraLevels.erase(it);
-            } else {
-                ++it;
-            }
-        }
-    } else {
-        // Sell order: match against bids (highest price first)
-        auto it = contraLevels.rbegin();
-        while (remaining > 0 && it != contraLevels.rend() && it->first >= incomingOrder.priceTick) {
-            auto& queue = it->second;
-            
-            while (remaining > 0 && !queue.empty()) {
-                Order* restingOrder = queue.front();
-                
-                if (UNLIKELY(restingOrder->ownerId == incomingOrder.ownerId)) {
-                    break;
-                }
-                
-                uint32_t fillQty = std::min(remaining, restingOrder->quantity);
-                
-                Fill fill{
-                    restingOrder->id,
-                    incomingOrder.id,
-                    fillQty,
-                    it->first,
-                    getCurrentTimeNs()
-                };
-                
-                if (fills) fills->push_back(fill);
-                if (fillCb_) fillCb_(fill);
-                
-                restingOrder->quantity -= fillQty;
-                remaining -= fillQty;
-                
-                if (restingOrder->quantity == 0) {
-                    orders_.erase(restingOrder->id);
-                    queue.pop_front();
-                }
-                
-                stats_.fillsGenerated.fetch_add(1, std::memory_order_relaxed);
-            }
-            
-            if (queue.empty()) {
-                // Convert reverse iterator to forward iterator for erase
-                auto forward_it = std::next(it).base();
-                contraLevels.erase(forward_it);
-                // Restart iteration from the beginning
-                it = contraLevels.rbegin();
-            } else {
-                ++it;
-            }
-        }
-    }
-}
+class OrderBook {
+public:
+    OrderBook(size_t maxOrders = 1000000);
+    ~OrderBook() = default;
 
-void OrderBook::restOrder(const Order& order, uint32_t remaining) {
-    Order newOrder = order;
-    newOrder.quantity = remaining;
-    newOrder.timestamp = getCurrentTimeNs();
-    
-    orders_[order.id] = newOrder;
-    Order* orderPtr = &orders_[order.id];
-    
-    auto& levels = (order.side == Side::Buy) ? bids_ : asks_;
-    levels[order.priceTick].push_back(orderPtr);
-    
-    orderCount_.fetch_add(1, std::memory_order_relaxed);
-    
-    // Update best price tracking
-    if (order.side == Side::Buy) {
-        int64_t currentBest = bestBidTick_.load(std::memory_order_relaxed);
-        while (order.priceTick > currentBest) {
-            if (bestBidTick_.compare_exchange_weak(currentBest, order.priceTick)) break;
-        }
-    } else {
-        int64_t currentBest = bestAskTick_.load(std::memory_order_relaxed);
-        while (order.priceTick < currentBest) {
-            if (bestAskTick_.compare_exchange_weak(currentBest, order.priceTick)) break;
-        }
-    }
-}
+    // Core operations
+    bool submitOrder(const Order& order, std::vector<Fill>* fills = nullptr);
+    bool cancelOrder(uint64_t orderId);
+    std::vector<Fill> modifyOrder(uint64_t orderId, int64_t newPrice, uint32_t newQty);
+    void cancelAll(Side side);
 
-bool OrderBook::canFullyFill(const Order& order) const {
-    uint32_t needed = order.quantity;
-    const auto& contraLevels = (order.side == Side::Buy) ? asks_ : bids_;
+    // Market data access
+    double bestBid() const;
+    double bestAsk() const;
+    std::vector<LevelInfo> getTopLevels(Side side, size_t depth) const;
     
-    if (order.side == Side::Buy) {
-        for (const auto& [price, queue] : contraLevels) {
-            if (price > order.priceTick) break;
-            
-            for (const Order* restingOrder : queue) {
-                if (restingOrder->ownerId == order.ownerId) continue;
-                
-                if (restingOrder->quantity >= needed) return true;
-                needed -= restingOrder->quantity;
-                if (needed == 0) return true;
-            }
-        }
-    } else {
-        for (auto it = contraLevels.rbegin(); it != contraLevels.rend(); ++it) {
-            if (it->first < order.priceTick) break;
-            
-            for (const Order* restingOrder : it->second) {
-                if (restingOrder->ownerId == order.ownerId) continue;
-                
-                if (restingOrder->quantity >= needed) return true;
-                needed -= restingOrder->quantity;
-                if (needed == 0) return true;
-            }
-        }
-    }
-    
-    return needed == 0;
-}
+    // Advanced features
+    uint64_t getTotalVolume(Side side) const;
+    double getWeightedMidPrice() const;
+    uint64_t getOrderCount() const { return orderCount_.load(); }
 
-double OrderBook::bestBid() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (bids_.empty()) return -1.0;
-    return bids_.rbegin()->first / double(TICK_PRECISION);
-}
-
-double OrderBook::bestAsk() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (asks_.empty()) return -1.0;
-    return asks_.begin()->first / double(TICK_PRECISION);
-}
-
-std::vector<LevelInfo> OrderBook::getTopLevels(Side side, size_t depth) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<LevelInfo> result;
-    result.reserve(depth);
+    using FillHandler = std::function<void(const Fill&)>;
+    void setFillHandler(FillHandler handler);
     
-    const auto& levels = (side == Side::Buy) ? bids_ : asks_;
-    
-    if (side == Side::Buy) {
-        // Bids: highest price first
-        for (auto it = levels.rbegin(); it != levels.rend() && result.size() < depth; ++it) {
-            uint64_t totalQty = 0;
-            for (const Order* order : it->second) {
-                totalQty += order->quantity;
-            }
-            result.push_back({
-                it->first,
-                totalQty,
-                static_cast<uint32_t>(it->second.size()),
-                0
-            });
-        }
-    } else {
-        // Asks: lowest price first
-        for (auto it = levels.begin(); it != levels.end() && result.size() < depth; ++it) {
-            uint64_t totalQty = 0;
-            for (const Order* order : it->second) {
-                totalQty += order->quantity;
-            }
-            result.push_back({
-                it->first,
-                totalQty,
-                static_cast<uint32_t>(it->second.size()),
-                0
-            });
-        }
-    }
-    
-    return result;
-}
-
-uint64_t OrderBook::getTotalVolume(Side side) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    uint64_t total = 0;
-    const auto& levels = (side == Side::Buy) ? bids_ : asks_;
-    
-    for (const auto& [price, queue] : levels) {
-        for (const Order* order : queue) {
-            total += order->quantity;
-        }
-    }
-    
-    return total;
-}
-
-double OrderBook::getWeightedMidPrice() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (bids_.empty() || asks_.empty()) return -1.0;
-    
-    double bid = bids_.rbegin()->first / double(TICK_PRECISION);
-    double ask = asks_.begin()->first / double(TICK_PRECISION);
-    
-    // Get volumes at best levels
-    uint64_t bidVol = 0, askVol = 0;
-    for (const Order* order : bids_.rbegin()->second) {
-        bidVol += order->quantity;
-    }
-    for (const Order* order : asks_.begin()->second) {
-        askVol += order->quantity;
-    }
-    
-    if (bidVol + askVol == 0) return (bid + ask) / 2.0;
-    return (bid * askVol + ask * bidVol) / (bidVol + askVol);
-}
-
-bool OrderBook::cancelOrder(uint64_t orderId) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    
-    auto it = orders_.find(orderId);
-    if (it == orders_.end()) return false;
-    
-    const Order& order = it->second;
-    auto& levels = (order.side == Side::Buy) ? bids_ : asks_;
-    
-    auto levelIt = levels.find(order.priceTick);
-    if (levelIt != levels.end()) {
-        auto& queue = levelIt->second;
-        queue.erase(std::remove_if(queue.begin(), queue.end(),
-                       [orderId](const Order* o) { return o->id == orderId; }),
-                   queue.end());
+    // Performance monitoring
+    struct Stats {
+        std::atomic<uint64_t> ordersProcessed{0};
+        std::atomic<uint64_t> fillsGenerated{0};
+        std::atomic<uint64_t> avgProcessingTimeNs{0};
+        std::atomic<uint64_t> peakOrdersPerSecond{0};
         
-        if (queue.empty()) {
-            levels.erase(levelIt);
-        }
-    }
-    
-    orders_.erase(it);
-    orderCount_.fetch_sub(1, std::memory_order_relaxed);
-    return true;
-}
-
-std::vector<Fill> OrderBook::modifyOrder(uint64_t orderId, int64_t newPrice, uint32_t newQty) {
-    std::vector<Fill> fills;
-    
-    // Find the order first
-    Order originalOrder;
-    bool found = false;
-    
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = orders_.find(orderId);
-        if (it != orders_.end()) {
-            originalOrder = it->second;
-            found = true;
-        }
-    }
-    
-    if (found) {
-        // Cancel and resubmit without nested locking
-        cancelOrder(orderId);
+        // Copy constructor and assignment deleted for atomics
+        Stats() = default;
+        Stats(const Stats&) = delete;
+        Stats& operator=(const Stats&) = delete;
         
-        Order modifiedOrder = originalOrder;
-        modifiedOrder.priceTick = newPrice;
-        modifiedOrder.quantity = newQty;
-        
-        submitOrder(modifiedOrder, &fills);
-    }
+        // Helper to get values
+        uint64_t getOrdersProcessed() const { return ordersProcessed.load(); }
+        uint64_t getFillsGenerated() const { return fillsGenerated.load(); }
+        uint64_t getAvgProcessingTimeNs() const { return avgProcessingTimeNs.load(); }
+        uint64_t getPeakOrdersPerSecond() const { return peakOrdersPerSecond.load(); }
+    };
     
-    return fills;
-}
+    const Stats& getStats() const { return stats_; }
+    void resetStats() { 
+        stats_.ordersProcessed = 0;
+        stats_.fillsGenerated = 0;
+        stats_.avgProcessingTimeNs = 0;
+        stats_.peakOrdersPerSecond = 0;
+    }
 
-void OrderBook::cancelAll(Side side) {
-    // Collect order IDs to cancel first
-    std::vector<uint64_t> toCancel;
+private:
+    // Core matching logic
+    bool canFullyFill(const Order& order) const;
+    void matchLoop(const Order& order, uint32_t& remaining, std::vector<Fill>* fills);
+    void restOrder(const Order& order, uint32_t remaining);
     
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& [id, order] : orders_) {
-            if (order.side == side) {
-                toCancel.push_back(id);
-            }
-        }
-    }
+    // Thread safe data structures using standard containers + mutex
+    mutable std::mutex mutex_;
+    std::map<int64_t, std::deque<Order*>> bids_;
+    std::map<int64_t, std::deque<Order*>> asks_;
+    std::unordered_map<uint64_t, Order> orders_;
     
-    // Cancel each order
-    for (uint64_t id : toCancel) {
-        cancelOrder(id);
-    }
-}
+    // Atomic counters for performance
+    std::atomic<uint64_t> orderCount_{0};
+    std::atomic<int64_t> bestBidTick_{0};
+    std::atomic<int64_t> bestAskTick_{INT64_MAX};
+    
+    mutable Stats stats_;
+    FillHandler fillCb_;
+    
+    // Utility functions
+    uint64_t getCurrentTimeNs() const;
+};
 
-void OrderBook::setFillHandler(FillHandler handler) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    fillCb_ = std::move(handler);
+namespace HFTUtils {
+    // Branch prediction hints
+#if defined(__GNUC__) || defined(__clang__)
+    #define LIKELY(x)   __builtin_expect(!!(x), 1)
+    #define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+    #define LIKELY(x)   (x)
+    #define UNLIKELY(x) (x)
+#endif
+    
+    // Memory barriers
+    inline void memoryBarrier() {
+        std::atomic_thread_fence(std::memory_order_acq_rel);
+    }
 }
